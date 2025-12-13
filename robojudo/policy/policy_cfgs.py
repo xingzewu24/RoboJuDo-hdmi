@@ -342,6 +342,43 @@ class AsapLocoPolicyCfg(PolicyCfg):
     command_base_height_default: float
 
 
+class HdmiPolicyCfg(PolicyCfg):
+    """Configuration for HDMI Policy from hdmi-sim2real.
+    
+    This config supports loading ONNX models trained with the HDMI framework.
+    
+    Example usage:
+        policy = HdmiPolicyCfg(
+            checkpoint_name="G1PushDoorHand",
+            model_file="policy-xg6644nr-final.onnx",
+        )
+    """
+    policy_type: str = "HdmiPolicy"
+    disable_autoload: bool = True  # We handle loading ourselves
+    
+    # HDMI-specific configuration
+    hdmi_base_path: str = "hdmi-sim2real"  # Path to hdmi-sim2real folder (set in subclass)
+    checkpoint_name: str = "G1PushDoorHand"  # e.g., "G1PushDoorHand", "G1RollBall"
+    model_file: str = "policy-xg6644nr-final.onnx"  # e.g., "policy-xg6644nr-final.onnx"
+    
+    # Policy parameters
+    action_scale: float = 0.25
+    action_beta: float = 0.8  # Action smoothing
+    
+    # Hidden state for recurrent policy
+    adapt_hx_size: int = 256
+    
+    # Whether to use residual action (add to reference)
+    use_residual_action: bool = False
+    
+    @property
+    def policy_file(self) -> str:
+        """Path to the ONNX model file."""
+        if self.hdmi_base_path and self.checkpoint_name and self.model_file:
+            return f"{self.hdmi_base_path}/checkpoints/{self.checkpoint_name}/{self.model_file}"
+        return ""
+
+
 class KungfuBotGeneralPolicyCfg(PolicyCfg):
     policy_type: str = "KungfuBotGeneralPolicy"
     disable_autoload: bool = True

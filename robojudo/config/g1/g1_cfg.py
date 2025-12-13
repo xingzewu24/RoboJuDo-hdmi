@@ -29,6 +29,7 @@ from .policy.g1_kungfubot_policy_cfg import G1KungfuBotGeneralPolicyCfg, G1Kungf
 from .policy.g1_smooth_policy_cfg import G1SmoothPolicyCfg  # noqa: F401
 from .policy.g1_twist_policy_cfg import G1TwistPolicyCfg  # noqa: F401
 from .policy.g1_unitree_policy_cfg import G1UnitreePolicyCfg, G1UnitreeWoGaitPolicyCfg  # noqa: F401
+from .policy.g1_hdmi_policy_cfg import G1HdmiPolicyCfg, G1HdmiPushDoorPolicyCfg  # noqa: F401
 
 
 # ======================== Basic Configs ======================== #
@@ -254,6 +255,38 @@ class g1_asap_loco(RlPipelineCfg):
     ]
 
     policy: G1AsapLocoPolicyCfg = G1AsapLocoPolicyCfg()
+
+
+@cfg_registry.register
+class g1_hdmi(RlPipelineCfg):
+    """
+    HDMI Policy deployment for G1 robot.
+    Run HDMI-trained policies (G1PushDoorHand, G1RollBall, G1TrackSuitcase) in simulation.
+    
+    Usage:
+        python scripts/run_pipeline.py -c g1_hdmi
+    
+    To change checkpoint, modify the policy config:
+        policy: G1HdmiPolicyCfg = G1HdmiPolicyCfg(
+            checkpoint_name="G1RollBall",
+            model_file="policy-yte3rr8b-final.onnx",
+        )
+    """
+
+    robot: str = "g1"
+    env: G1MujocoEnvCfg = G1MujocoEnvCfg()
+
+    ctrl: list[KeyboardCtrlCfg] = [
+        KeyboardCtrlCfg(
+            triggers={
+                "i": "[SIM_REBORN]",
+                "o": "[SHUTDOWN]",
+                "r": "[POLICY_RESET]",
+            }
+        ),
+    ]
+
+    policy: G1HdmiPushDoorPolicyCfg = G1HdmiPushDoorPolicyCfg()
 
 
 @cfg_registry.register
