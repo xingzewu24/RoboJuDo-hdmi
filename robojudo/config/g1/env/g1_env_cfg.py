@@ -216,3 +216,65 @@ class G1_12EnvCfg(EnvCfg):
     )
     update_with_fk: bool = False
     torso_name: str = "pelvis"  # no torso in 12dof model
+
+
+class G1HdmiDoF(G1_29DoF):
+    """G1 DoF configuration for HDMI policies with proper standing pose and PD gains."""
+    # Override default_pos with HDMI standing pose from checkpoint yaml
+    default_pos: list[float] | None = [
+        # Left leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+        *[-0.312, 0.0, 0.0, 0.669, -0.363, 0.0],
+        # Right leg: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll  
+        *[-0.312, 0.0, 0.0, 0.669, -0.363, 0.0],
+        # Waist: yaw, roll, pitch
+        *[0.0, 0.0, 0.0],
+        # Left arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
+        *[0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0],
+        # Right arm: shoulder_pitch, shoulder_roll, shoulder_yaw, elbow, wrist_roll, wrist_pitch, wrist_yaw
+        *[0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0],
+    ]
+    
+    # Ground truth stiffness (Kp) from HDMI yaml: policy-xg6644nr-final.yaml
+    # Order: left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7) = 29 total
+    stiffness: list[float] | None = [
+        # Left leg: hip_pitch=40.18, hip_roll=99.10, hip_yaw=40.18, knee=99.10, ankle_pitch=28.50, ankle_roll=28.50
+        *[40.18, 99.10, 40.18, 99.10, 28.50, 28.50],
+        # Right leg: same as left
+        *[40.18, 99.10, 40.18, 99.10, 28.50, 28.50],
+        # Waist: yaw=40.18, roll=28.50, pitch=28.50
+        *[40.18, 28.50, 28.50],
+        # Left arm: shoulder_pitch=14.25, shoulder_roll=14.25, shoulder_yaw=14.25, elbow=14.25, wrist_roll=14.25, wrist_pitch=16.78, wrist_yaw=16.78
+        *[14.25, 14.25, 14.25, 14.25, 14.25, 16.78, 16.78],
+        # Right arm: same as left
+        *[14.25, 14.25, 14.25, 14.25, 14.25, 16.78, 16.78],
+    ]
+    
+    # Ground truth damping (Kd) from HDMI yaml
+    damping: list[float] | None = [
+        # Left leg: hip_pitch=2.56, hip_roll=6.31, hip_yaw=2.56, knee=6.31, ankle_pitch=1.81, ankle_roll=1.81
+        *[2.56, 6.31, 2.56, 6.31, 1.81, 1.81],
+        # Right leg: same as left
+        *[2.56, 6.31, 2.56, 6.31, 1.81, 1.81],
+        # Waist: yaw=2.56, roll=1.81, pitch=1.81
+        *[2.56, 1.81, 1.81],
+        # Left arm: shoulder_pitch=0.91, shoulder_roll=0.91, shoulder_yaw=0.91, elbow=0.91, wrist_roll=0.91, wrist_pitch=1.07, wrist_yaw=1.07
+        *[0.91, 0.91, 0.91, 0.91, 0.91, 1.07, 1.07],
+        # Right arm: same as left
+        *[0.91, 0.91, 0.91, 0.91, 0.91, 1.07, 1.07],
+    ]
+
+
+class G1PushDoorEnvCfg(EnvCfg):
+    """G1 environment with door for push door task (HDMI G1PushDoorHand)."""
+    xml: str = (ASSETS_DIR / "scenes/g1_pushdoor.xml").as_posix()
+
+    # Use HDMI-specific DoF with proper standing pose
+    dof: DoFConfig = G1HdmiDoF()
+
+    forward_kinematic: ForwardKinematicCfg | None = ForwardKinematicCfg(
+        xml_path=xml,
+        debug_viz=False,
+        kinematic_joint_names=dof.joint_names,
+    )
+    update_with_fk: bool = True
+    torso_name: str = "torso_link"
