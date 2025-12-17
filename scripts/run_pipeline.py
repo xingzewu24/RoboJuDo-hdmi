@@ -26,6 +26,11 @@ def parse_args():
         default="g1",
         help="Name of the config class to use",
     )
+    parser.add_argument(
+        "--wait-start",
+        action="store_true",
+        help="Start with policy disabled; press Enter to begin policy control",
+    )
     args = parser.parse_args()
     return args
 
@@ -43,6 +48,17 @@ def main():
     logger.info(f"Using pipeline: {pipeline_type} -> {pipeline_class}")
 
     pipeline = pipeline_class(cfg=cfg)
+
+    if args.wait_start:
+        pipeline.policy_enabled = False
+        logger.info("Policy is paused. Robot will hold default pose. Press Enter to start policy...")
+        try:
+            input()
+        except KeyboardInterrupt:
+            logger.info("Interrupted before start. Exiting.")
+            return
+        pipeline.policy_enabled = True
+        logger.info("Policy started.")
 
     if not cfg.env.is_sim:
         pipeline.prepare()

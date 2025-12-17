@@ -79,6 +79,9 @@ class RlPipeline(Pipeline):
             device=self.device,
         )
 
+        # Policy can be held until user triggers start.
+        self.policy_enabled: bool = True
+
         self.env.update_dof_cfg(override_cfg=self.policy.cfg_action_dof)
         self.visualizer = self.env.visualizer
 
@@ -153,8 +156,14 @@ class RlPipeline(Pipeline):
         if len(commands) > 0:
             logger.info(f"{'=' * 10} COMMANDS {'=' * 10}\n{commands}")
 
-        obs, extras = self.policy.get_observation(env_data, ctrl_data)
-        pd_target = self.policy.get_pd_target(obs)
+        if self.policy_enabled:
+            obs, extras = self.policy.get_observation(env_data, ctrl_data)
+            pd_target = self.policy.get_pd_target(obs)
+        else:
+            # Hold standing pose; skip policy inference/log spam while paused.
+            pd_target = self.env.dof_cfg.default_pos
+            obs = None
+            extras = {}
 
         if not dry_run:
             self.env.step(pd_target, extras.get("hand_pose", None))

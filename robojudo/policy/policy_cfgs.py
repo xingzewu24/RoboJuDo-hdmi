@@ -364,12 +364,22 @@ class HdmiPolicyCfg(PolicyCfg):
     # Policy parameters
     action_scale: float = 0.25
     action_beta: float = 0.8  # Action smoothing
+
+    # Warmup behavior
+    # If set to 0, policy starts immediately (no standing warmup / no warmup action clamp).
+    warmup_steps: int = 100
+    warmup_max_action_start: float = 0.05
+    warmup_max_action_final: float = 0.25
     
     # Hidden state for recurrent policy
     adapt_hx_size: int = 256
     
     # Whether to use residual action (add to reference)
     use_residual_action: bool = False
+    
+    # Optional: flip sign of specific action joints (by joint name in action_dof.joint_names).
+    # Useful when sim joint axes differ from the training environment conventions.
+    action_sign_flip_joints: list[str] = []
     
     @property
     def policy_file(self) -> str:

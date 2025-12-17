@@ -350,6 +350,23 @@
     <framequat name="door_panel_quat" objtype="xbody" objname="door_panel" />
   </sensor>
 
+  <!-- ======== KEYFRAMES ======== -->
+  <!-- HDMI default standing pose for G1 robot -->
+  <!-- Joint order (29 DOF): left_leg(6), right_leg(6), waist(3), left_arm(7), right_arm(7) -->
+  <!-- qpos format: base_pos(3), base_quat(4, wxyz), joints(29), door_joint(1) -->
+  <keyframe>
+    <key name="hdmi_standing" qpos="
+      0 0 0.793
+      1 0 0 0
+      -0.312 0.0 0.0 0.669 -0.363 0.0
+      -0.312 0.0 0.0 0.669 -0.363 0.0
+      0.0 0.0 0.0
+      0.2 0.2 0.0 0.6 0.0 0.0 0.0
+      0.2 -0.2 0.0 0.6 0.0 0.0 0.0
+      0.0
+    " />
+  </keyframe>
+
   <!-- ======== VISUAL SETTINGS ======== -->
   <statistic center="0.5 0.0 1.0" extent="1.5"/>
   <visual>

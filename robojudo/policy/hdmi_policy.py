@@ -19,6 +19,8 @@ import numpy as np
 import onnxruntime as ort
 import yaml
 
+from collections import deque
+
 from robojudo.policy import Policy, policy_registry
 from robojudo.policy.policy_cfgs import HdmiPolicyCfg
 
@@ -27,11 +29,14 @@ logger = logging.getLogger(__name__)
 
 def quat_rotate_inverse_numpy(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     """Rotate a vector by the inverse of a quaternion.
-    
+
+    NOTE: HDMI/Isaac convention uses quaternions in [w, x, y, z].
+    RoboJuDo environment states commonly provide [x, y, z, w], so convert at call sites.
+
     Args:
         q: Quaternion in (w, x, y, z) format. Shape (..., 4)
         v: Vector to rotate. Shape (..., 3)
-    
+
     Returns:
         Rotated vector. Shape (..., 3)
     """
@@ -61,10 +66,15 @@ class HdmiPolicy(Policy):
     The HDMI policy expects observations in a specific format based on
     the observation registry classes defined in hdmi-sim2real.
     
+    IMPORTANT: Joint Order Conversion
+    - MuJoCo provides joints in depth-first tree traversal order
+    - HDMI policy expects joints in Isaac order (interleaved left/right)
+    - This class handles the conversion automatically
+    
     Key observations:
     - projected_gravity_b: Gravity vector in body frame (3,)
     - root_ang_vel_b: Base angular velocity in body frame (3,)
-    - joint_pos: Joint positions relative to default (num_dofs,)
+    - joint_pos: Joint positions relative to default (num_dofs,) in Isaac order
     - joint_vel: Joint velocities (num_dofs,)
     - prev_actions: Previous action outputs (num_actions,)
     
@@ -78,12 +88,11 @@ class HdmiPolicy(Policy):
     # Default door position for G1PushDoorHand task (3m in front of robot)
     DOOR_POSITION_WORLD = np.array([3.0, 0.0, 0.0])
     
-    # Warmup configuration: robot stands still for first N steps (~2 seconds at 50Hz)
-    WARMUP_STEPS = 100  # 2 seconds at 50Hz
+    # Default warmup configuration (can be overridden by config)
+    DEFAULT_WARMUP_STEPS = 100  # 2 seconds at 50Hz
     
     # G1 standing default pose based on HDMI checkpoint (from yaml: default_joint_pos)
-    # Order: matches HDMI policy_joint_names (23 joints, Isaac order)
-    G1_HDMI_DEFAULT_POSE_ISAAC_ORDER = {
+    G1_HDMI_DEFAULT_POSE = {
         "left_hip_pitch_joint": -0.312,
         "right_hip_pitch_joint": -0.312,
         "waist_yaw_joint": 0.0,
@@ -107,9 +116,35 @@ class HdmiPolicy(Policy):
         "right_shoulder_yaw_joint": 0.0,
         "left_elbow_joint": 0.6,
         "right_elbow_joint": 0.6,
+        "left_wrist_roll_joint": 0.0,
+        "right_wrist_roll_joint": 0.0,
+        "left_wrist_pitch_joint": 0.0,
+        "right_wrist_pitch_joint": 0.0,
+        "left_wrist_yaw_joint": 0.0,
+        "right_wrist_yaw_joint": 0.0,
     }
     
     def __init__(self, cfg_policy: HdmiPolicyCfg, device: str = "cpu"):
+        # Import joint order mapping from config
+        from robojudo.config.g1.policy.g1_hdmi_policy_cfg import (
+            MUJOCO_TO_ISAAC_29, ISAAC_TO_MUJOCO_29,
+            MUJOCO_TO_ISAAC_23, ISAAC_TO_MUJOCO_23,
+            HDMI_ISAAC_JOINT_NAMES_29, HDMI_ISAAC_JOINT_NAMES_23,
+            DEFAULT_POS_ISAAC_29, DEFAULT_POS_ISAAC_23,
+        )
+        
+        # Store joint reordering indices
+        self.mujoco_to_isaac_29 = np.array(MUJOCO_TO_ISAAC_29)
+        self.isaac_to_mujoco_29 = np.array(ISAAC_TO_MUJOCO_29)
+        self.mujoco_to_isaac_23 = np.array(MUJOCO_TO_ISAAC_23)
+        self.isaac_to_mujoco_23 = np.array(ISAAC_TO_MUJOCO_23)
+        
+        # Store Isaac order joint names and defaults
+        self.isaac_joint_names_29 = HDMI_ISAAC_JOINT_NAMES_29
+        self.isaac_joint_names_23 = HDMI_ISAAC_JOINT_NAMES_23
+        self.default_pos_isaac_29 = np.array(DEFAULT_POS_ISAAC_29, dtype=np.float32)
+        self.default_pos_isaac_23 = np.array(DEFAULT_POS_ISAAC_23, dtype=np.float32)
+        
         # Setup ONNX session
         sess_options = ort.SessionOptions()
         
@@ -168,6 +203,10 @@ class HdmiPolicy(Policy):
         # Previous actions buffer (for 3 timesteps of history as per HDMI config)
         self.prev_actions_history = [np.zeros(self.num_actions, dtype=np.float32) for _ in range(3)]
         self.prev_actions_buffer = np.zeros(self.num_actions, dtype=np.float32)
+
+        # Joint position history buffer for HDMI observation (lags [0,1,2,3,4,8]).
+        # Store Isaac-order raw joint positions (29,).
+        self._joint_pos_hist: deque[np.ndarray] = deque(maxlen=9)
         
         # Observation scaling factors (common IsaacGym/HDMI defaults)
         self.obs_scales = {
@@ -185,6 +224,14 @@ class HdmiPolicy(Policy):
         
         # Step counter for warmup period
         self.step_count = 0
+
+        # Warmup settings (configurable)
+        self.warmup_steps = getattr(cfg_policy, "warmup_steps", self.DEFAULT_WARMUP_STEPS)
+        self.warmup_max_action_start = getattr(cfg_policy, "warmup_max_action_start", 0.05)
+        self.warmup_max_action_final = getattr(cfg_policy, "warmup_max_action_final", 0.25)
+
+        # Optional action sign flips (joint names are in MuJoCo action order = cfg_policy.action_dof.joint_names)
+        self._action_flip_set = set(getattr(cfg_policy, "action_sign_flip_joints", []) or [])
         
         # Safety mode: disabled by default since we now provide proper observations
         self.safety_mode = False
@@ -208,8 +255,13 @@ class HdmiPolicy(Policy):
             # elbow, elbow
             0.44, 0.44,
         ], dtype=np.float32)
+        # Global scale multiplier (lets us safely tune amplitude without editing hardcoded YAML scales)
+        # NOTE: This is the PolicyCfg.action_scale, not the YAML per-joint action_scale map.
+        self.global_action_scale = float(getattr(cfg_policy, "action_scale", 1.0))
+
         # Fallback single scale (used if action_scales shape doesn't match)
-        self.action_scale = 0.5
+        # Keep this as 1.0; cfg_policy.action_scale is applied via self.global_action_scale.
+        self.action_scale = 1.0
         
         # Load motion data for reference trajectory
         self._load_motion_data()
@@ -217,7 +269,10 @@ class HdmiPolicy(Policy):
         logger.info(f"[HdmiPolicy] Initialized with {self.num_dofs} obs dofs, {self.num_actions} action dofs")
         logger.info(f"[HdmiPolicy] Default standing pose (first 6): {self.default_dof_pos[:6]}")
         logger.info(f"[HdmiPolicy] Door position: {self.door_pos_world}")
-        logger.info(f"[HdmiPolicy] Warmup steps: {self.WARMUP_STEPS} (~{self.WARMUP_STEPS/50:.1f}s)")
+        if self.warmup_steps > 0:
+            logger.info(f"[HdmiPolicy] Warmup steps: {self.warmup_steps} (~{self.warmup_steps/50:.1f}s)")
+        else:
+            logger.info("[HdmiPolicy] Warmup disabled (warmup_steps=0): starting policy immediately")
     
     def _load_motion_data(self):
         """Load motion reference data for walking trajectory."""
@@ -292,16 +347,20 @@ class HdmiPolicy(Policy):
             logger.warning(f"[HdmiPolicy] Motion path not found: {motion_path}")
     
     def _setup_default_pose(self):
-        """Setup default standing pose from HDMI checkpoint config or class defaults."""
-        # Get joint names from observation dof config
+        """Setup default standing pose from HDMI checkpoint config.
+        
+        Sets up two versions of the default pose:
+        - default_dof_pos: MuJoCo order (for environment interaction)
+        - default_dof_pos_isaac: Isaac order (for policy observation normalization)
+        """
+        # Get joint names from observation dof config (MuJoCo order)
         obs_joint_names = self.cfg_obs_dof.joint_names
         
-        # Build default pose array in observation order
-        hdmi_defaults = self.G1_HDMI_DEFAULT_POSE_ISAAC_ORDER
+        # Build default pose dictionary from yaml or class defaults
+        hdmi_defaults = self.G1_HDMI_DEFAULT_POSE.copy()
         
         # If we have yaml config, extract default_joint_pos from it
         if self.yaml_config and "default_joint_pos" in self.yaml_config:
-            hdmi_defaults = {}
             yaml_defaults = self.yaml_config["default_joint_pos"]
             
             # Parse regex-style defaults from yaml (e.g., ".*_hip_pitch_joint": -0.312)
@@ -312,18 +371,23 @@ class HdmiPolicy(Policy):
                         hdmi_defaults[joint_name] = value
                         break
         
-        # Build default pose array
+        # Build default pose array in MuJoCo order (for environment)
         new_default_pos = []
         for joint_name in obs_joint_names:
             if joint_name in hdmi_defaults:
                 new_default_pos.append(hdmi_defaults[joint_name])
             else:
-                # Use 0.0 for joints not in the HDMI defaults (e.g., wrist joints)
                 new_default_pos.append(0.0)
         
         self.default_dof_pos = np.array(new_default_pos, dtype=np.float32)
-        logger.info(f"[HdmiPolicy] Setup HDMI default standing pose ({len(self.default_dof_pos)} dofs): {self.default_dof_pos[:6]}...")
-        logger.info(f"[HdmiPolicy] Full default pose: {self.default_dof_pos}")
+        
+        # Also store default pose in Isaac order (for policy observations)
+        # This is used for normalizing observations before feeding to ONNX model
+        self.default_dof_pos_isaac = self.default_pos_isaac_29.copy()
+        
+        logger.info(f"[HdmiPolicy] Setup default pose in MuJoCo order ({len(self.default_dof_pos)} dofs)")
+        logger.info(f"[HdmiPolicy] MuJoCo default[:6]: {self.default_dof_pos[:6]}")
+        logger.info(f"[HdmiPolicy] Isaac default[:6]: {self.default_dof_pos_isaac[:6]}")
 
     
     def reset(self):
@@ -334,7 +398,11 @@ class HdmiPolicy(Policy):
         self.last_action = np.zeros(self.num_actions)
         self.motion_step = 0
         self.step_count = 0
-        logger.info("[HdmiPolicy] Reset: starting warmup period")
+        self._joint_pos_hist.clear()
+        if self.warmup_steps > 0:
+            logger.info("[HdmiPolicy] Reset: starting warmup period")
+        else:
+            logger.info("[HdmiPolicy] Reset: warmup disabled")
     
     def post_step_callback(self, commands: list[str] | None = None):
         """Handle any post-step commands."""
@@ -377,14 +445,12 @@ class HdmiPolicy(Policy):
         # Door position in world frame
         door_pos_w = self.door_pos_world
         
-        # Get yaw-only quaternion for computing body-frame coordinates
-        # Extract yaw from quaternion (simplified: assume flat ground)
-        yaw_quat = base_quat.copy()
-        # Zero out pitch and roll (keep only yaw rotation around Z)
-        # For a yaw-only quaternion: q = [cos(yaw/2), 0, 0, sin(yaw/2)]
-        # We can extract this by normalizing the w and z components
-        norm = np.sqrt(yaw_quat[0]**2 + yaw_quat[3]**2) + 1e-8
-        yaw_quat = np.array([yaw_quat[0]/norm, 0.0, 0.0, yaw_quat[3]/norm])
+        # Get yaw-only quaternion for computing body-frame coordinates.
+        # IMPORTANT: base_quat is a general quaternion (w, x, y, z). Normalizing only (w, z)
+        # is not a valid yaw extraction once roll/pitch exist. Extract yaw from the full quat.
+        w, x, y, z = float(base_quat[0]), float(base_quat[1]), float(base_quat[2]), float(base_quat[3])
+        yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+        yaw_quat = np.array([np.cos(yaw * 0.5), 0.0, 0.0, np.sin(yaw * 0.5)], dtype=np.float32)
         
         # Object XY position in body frame
         door_pos_b = quat_rotate_inverse_numpy(
@@ -446,18 +512,12 @@ class HdmiPolicy(Policy):
         
         command_obs = np.zeros(356, dtype=np.float32)
         
-        # Get default standing pose for action joints
-        action_joint_names = self.cfg_policy.action_dof.joint_names
-        default_action_pos = []
-        for jname in action_joint_names:
-            if jname in self.G1_HDMI_DEFAULT_POSE_ISAAC_ORDER:
-                default_action_pos.append(self.G1_HDMI_DEFAULT_POSE_ISAAC_ORDER[jname])
-            else:
-                default_action_pos.append(0.0)
-        default_action_pos = np.array(default_action_pos, dtype=np.float32)
+        # Get default standing pose for action joints (in Isaac order for policy)
+        # Use default_pos_isaac_23 which is already in Isaac order
+        default_action_pos = self.default_pos_isaac_23.copy()
         
         # Check if we're in warmup period
-        is_warmup = self.step_count < self.WARMUP_STEPS
+        is_warmup = self.warmup_steps > 0 and self.step_count < self.warmup_steps
         
         if is_warmup:
             # WARMUP MODE: Stand still with default pose
@@ -470,11 +530,11 @@ class HdmiPolicy(Policy):
                 start_idx = 240 + t * 23
                 command_obs[start_idx:start_idx + 23] = default_action_pos
             
-            if self.step_count % 50 == 0:
-                logger.info(f"[HdmiPolicy] Warmup: {self.step_count}/{self.WARMUP_STEPS} steps")
+            if self.warmup_steps > 0 and self.step_count % 50 == 0:
+                logger.info(f"[HdmiPolicy] Warmup: {self.step_count}/{self.warmup_steps} steps")
         else:
             # ACTIVE MODE: Use motion trajectory for walking
-            motion_t = self.step_count - self.WARMUP_STEPS
+            motion_t = self.step_count - self.warmup_steps
             
             if self.motion_data is not None and self.motion_data["joint_pos"] is not None:
                 # Use loaded motion data
@@ -557,6 +617,9 @@ class HdmiPolicy(Policy):
         - 'policy': (1, 249) - proprioceptive observations (joint pos, vel, gravity, actions)
         - 'object': (1, 7) - object tracking observations
         
+        IMPORTANT: Joint positions from MuJoCo are reordered to Isaac order before
+        being fed to the policy, since the HDMI policy was trained with Isaac order.
+        
         Args:
             env_data: Environment state data (dof_pos, dof_vel, base_quat, etc.)
             ctrl_data: Controller data (commands, etc.)
@@ -564,33 +627,48 @@ class HdmiPolicy(Policy):
         Returns:
             Tuple of (observation_dict, extras_dict)
         """
-        # Extract state from env_data
-        dof_pos = env_data.dof_pos  # (num_obs_dofs,) = (29,) for G1
-        dof_vel = env_data.dof_vel  # (num_obs_dofs,) = (29,)
-        base_quat = env_data.torso_quat  # (4,) in (w, x, y, z) format
+        # Increment step counter for warmup logic (done here since pipeline calls get_observation directly)
+        self.step_count += 1
+        
+        # Extract state from env_data (MuJoCo order)
+        dof_pos_mujoco = env_data.dof_pos  # (num_obs_dofs,) = (29,) for G1, MuJoCo order
+        dof_vel_mujoco = env_data.dof_vel  # (num_obs_dofs,) = (29,), MuJoCo order
+        # RoboJuDo provides quaternions as [x, y, z, w].
+        # IMPORTANT: HDMI "root" signals (projected gravity / yaw-only transforms) should use the
+        # *base/free-joint* orientation. Using torso link orientation can introduce a systematic bias
+        # (torso may pitch/roll relative to pelvis), which destabilizes the policy.
+        base_quat_xyzw = env_data.base_quat
+        if base_quat_xyzw is None:
+            base_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        base_quat = base_quat_xyzw[[3, 0, 1, 2]]
         base_ang_vel = env_data.base_ang_vel  # (3,) in body frame
-        base_pos = getattr(env_data, 'base_pos', np.array([0.0, 0.0, 0.793]))  # Default standing height
+        base_pos = getattr(env_data, 'base_pos', None)
+        if base_pos is None:
+            base_pos = np.array([0.0, 0.0, 0.793], dtype=np.float32)  # Default standing height
+        
+        # CRITICAL: Reorder joint positions from MuJoCo order to Isaac order
+        # The HDMI policy was trained with Isaac order (interleaved left/right)
+        dof_pos_isaac = dof_pos_mujoco[self.mujoco_to_isaac_29]  # (29,) Isaac order
+        dof_vel_isaac = dof_vel_mujoco[self.mujoco_to_isaac_29]  # (29,) Isaac order
         
         # Compute common observations with scaling
         obs_projected_gravity = self._compute_projected_gravity(base_quat)  # (3,)
         obs_ang_vel = base_ang_vel * self.obs_scales["ang_vel"]  # (3,) scaled
         
-        # CRITICAL: Normalize joint positions relative to default pose
-        # Raw dof_pos causes extreme policy outputs!
-        if dof_pos.shape != self.default_dof_pos.shape:
-            logger.error(f"[HdmiPolicy] Shape mismatch! dof_pos={dof_pos.shape}, default={self.default_dof_pos.shape}")
-        obs_dof_pos = (dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"]  # relative to default (29,)
-        obs_dof_vel = dof_vel * self.obs_scales["dof_vel"]  # (29,) scaled
+        # IMPORTANT: HDMI uses RAW joint positions without subtracting default pose
+        # This matches the hdmi-sim2real reference implementation in joint_pos_history
+        # The policy was trained with raw positions, not normalized by default
+        obs_dof_pos = dof_pos_isaac * self.obs_scales["dof_pos"]  # (29,) - RAW, no normalization
+        obs_dof_vel = dof_vel_isaac * self.obs_scales["dof_vel"]  # (29,) scaled
         
         # Debug logging (first few steps only)
         if self.step_count < 5:
-            logger.info(f"[HdmiPolicy] Step {self.step_count}: RAW dof_pos[:6]={dof_pos[:6]}")
-            logger.info(f"[HdmiPolicy] Step {self.step_count}: RAW dof_vel[:6]={dof_vel[:6]}")
-            logger.info(f"[HdmiPolicy] Step {self.step_count}: default_dof_pos[:6]={self.default_dof_pos[:6]}")
-            logger.info(f"[HdmiPolicy] Step {self.step_count}: NORMALIZED obs_dof_pos[:6]={obs_dof_pos[:6]} (should be near 0 if standing)")
+            logger.info(f"[HdmiPolicy] Step {self.step_count}: MuJoCo dof_pos[:6]={dof_pos_mujoco[:6]}")
+            logger.info(f"[HdmiPolicy] Step {self.step_count}: Isaac dof_pos[:6]={dof_pos_isaac[:6]}")
+            logger.info(f"[HdmiPolicy] Step {self.step_count}: RAW obs_dof_pos[:6]={obs_dof_pos[:6]} (raw positions for HDMI)")
             logger.info(f"[HdmiPolicy] Step {self.step_count}: base_ang_vel={base_ang_vel}, gravity={obs_projected_gravity}")
         
-        # HDMI uses history of prev_actions (3 steps)
+        # HDMI uses history of prev_actions (3 steps) - already in Isaac order
         obs_prev_actions = np.concatenate(self.prev_actions_history).astype(np.float32)  # (23*3=69,)
         
         # Build 'policy' observation group (proprioceptive data)
@@ -601,9 +679,15 @@ class HdmiPolicy(Policy):
         # - prev_actions (steps: 3) -> 23*3 = 69
         # Total = 3 + 3 + 174 + 69 = 249
         
-        # For now, we use current observations for all history steps
-        # This is a simplification; full implementation would track observation history
-        joint_pos_history = np.tile(obs_dof_pos, 6)  # 6 history steps -> 174
+        # HDMI uses joint position history steps [0,1,2,3,4,8] (0 = current).
+        # Maintain a small buffer so the policy sees a more realistic temporal context.
+        self._joint_pos_hist.append(obs_dof_pos.copy())
+        while len(self._joint_pos_hist) < 9:
+            # Pad initial history with the first observed pose.
+            self._joint_pos_hist.appendleft(obs_dof_pos.copy())
+
+        history_lags = [0, 1, 2, 3, 4, 8]
+        joint_pos_history = np.concatenate([self._joint_pos_hist[-(lag + 1)] for lag in history_lags], axis=0)
         
         policy_obs = np.concatenate([
             obs_projected_gravity,     # 3
@@ -623,6 +707,8 @@ class HdmiPolicy(Policy):
             "command": command_obs[None, :],  # (1, 356)
             "policy": policy_obs[None, :],    # (1, 249)
             "object": object_obs[None, :],    # (1, 7)
+            # Some HDMI ONNX models use this boolean to reset internal recurrent state.
+            "is_init": np.array([self.step_count == 1], dtype=bool),
         }
         
         extras = {
@@ -705,6 +791,21 @@ class HdmiPolicy(Policy):
         action = (1 - self.action_beta) * self.last_action + self.action_beta * action
         self.last_action = action.copy()
         
+        # CRITICAL: Clamp actions during warmup for stability
+        # During warmup, the robot should stay near default pose
+        if self.warmup_steps > 0 and self.step_count <= self.warmup_steps:
+            # Progressively increase action range during warmup
+            warmup_progress = min(1.0, self.step_count / max(1, self.warmup_steps))
+            max_action = self.warmup_max_action_start + (
+                self.warmup_max_action_final - self.warmup_max_action_start
+            ) * warmup_progress
+            action = np.clip(action, -max_action, max_action)
+
+            if self.step_count % 25 == 0:
+                logger.info(
+                    f"[HdmiPolicy] Warmup {self.step_count}/{self.warmup_steps}: max_action={max_action:.3f}"
+                )
+        
         # Store for next step's observation (shift history and add new)
         self.prev_actions_history.pop(0)  # Remove oldest
         self.prev_actions_history.append(action.copy())  # Add newest
@@ -716,12 +817,40 @@ class HdmiPolicy(Policy):
             effective_scales = self.action_scales
         else:
             effective_scales = self.action_scale
+
+        # Always apply global scale multiplier from config.
+        # This makes cfg_policy.action_scale effective even when YAML per-joint scales exist.
+        effective_scales = effective_scales * self.global_action_scale
             
         if self.safety_mode:
             # Reduce action magnitude when in safety mode (no tracking data)
             effective_scales = effective_scales * self.safety_action_scale
         
         scaled_actions = action * effective_scales
+        
+        # CRITICAL: Reorder actions from Isaac order to MuJoCo order
+        # The DoFAdapter in PolicyWrapper expects actions in the same order as cfg_action_dof.joint_names
+        # which is MuJoCo order (MUJOCO_JOINT_NAMES_23)
+        scaled_actions_mujoco = scaled_actions[self.isaac_to_mujoco_23]
+
+        # Optional: fix sign convention mismatches by flipping selected joints.
+        # Names are interpreted in MuJoCo action joint order.
+        if self._action_flip_set:
+            mujoco_action_joint_names = self.cfg_policy.action_dof.joint_names
+            flip_mask = np.array([name in self._action_flip_set for name in mujoco_action_joint_names], dtype=bool)
+            if np.any(flip_mask):
+                scaled_actions_mujoco = scaled_actions_mujoco.copy()
+                scaled_actions_mujoco[flip_mask] *= -1.0
+                if self.step_count == 1:
+                    flipped = [mujoco_action_joint_names[i] for i in np.where(flip_mask)[0]]
+                    logger.info(f"[HdmiPolicy] Action sign flip enabled for: {flipped}")
+
+        # Debug a tiny summary early to confirm scaling/reordering.
+        if self.step_count <= 3:
+            logger.info(
+                f"[HdmiPolicy] Step {self.step_count}: action(isaac)[:6]={action[:6]}, "
+                f"scaled_action(mj)[:6]={scaled_actions_mujoco[:6]}"
+            )
         
         # Debug: print shapes periodically
         if hasattr(self, '_step_count'):
@@ -730,43 +859,37 @@ class HdmiPolicy(Policy):
             self._step_count = 0
         
         if self._step_count % 100 == 0:
-            logger.debug(f"[HdmiPolicy] Step {self._step_count}: action shape={action.shape}, scaled_actions shape={scaled_actions.shape}")
+            logger.debug(f"[HdmiPolicy] Step {self._step_count}: action shape={action.shape}, scaled_actions shape={scaled_actions_mujoco.shape}")
         
-        return scaled_actions
+        return scaled_actions_mujoco
     
     def __call__(self, env_data, ctrl_data) -> dict:
         """
         Main policy interface for RoboJuDo.
+        
+        The get_action() method returns actions already converted to MuJoCo order.
         
         Args:
             env_data: Environment state
             ctrl_data: Controller data
         
         Returns:
-            Dictionary with 'target_q' for joint position targets
+            Dictionary with 'target_q' for joint position targets (in MuJoCo order)
         """
-        # Increment step counter for warmup logic
-        self.step_count += 1
-        
+        # Note: step_count is incremented in get_observation()
         obs_dict, extras = self.get_observation(env_data, ctrl_data)
-        actions = self.get_action(obs_dict)
+        actions_mujoco = self.get_action(obs_dict)  # Actions already in MuJoCo order (23 DOFs)
         
-        # Compute target joint positions
-        # NOTE: Use self.default_pos (action-space, 23 DOFs) NOT self.default_dof_pos (obs-space, 29 DOFs)
-        target_q = self.default_pos.copy()
+        # Note: Warmup action clamping is now done in get_action()
         
-        # During warmup, dampen actions further for stability
-        if self.step_count <= self.WARMUP_STEPS:
-            # Clamp actions to small range during warmup
-            actions = np.clip(actions, -0.1, 0.1)
-        
-        target_q += actions
+        # Compute target joint positions (in MuJoCo order)
+        # self.default_pos is already in MuJoCo order (from config)
+        target_q = self.default_pos.copy() + actions_mujoco
         
         # Debug first few steps
         if self.step_count <= 3:
-            logger.info(f"[HdmiPolicy] __call__ step {self.step_count}: actions[:6]={actions[:6]}, target_q[:6]={target_q[:6]}")
+            logger.info(f"[HdmiPolicy] __call__ step {self.step_count}:")
+            logger.info(f"  actions_mujoco[:6]={actions_mujoco[:6]}")
+            logger.info(f"  target_q[:6]={target_q[:6]}")
         
-        return {
-            "target_q": target_q,
-            "extras": extras,
-        }
+        return {"target_q": target_q}
