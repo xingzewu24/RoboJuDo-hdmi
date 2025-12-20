@@ -23,9 +23,7 @@ from .env.g1_mujuco_env_cfg import G1_12MujocoEnvCfg, G1_23MujocoEnvCfg, G1Mujoc
 from .env.g1_real_env_cfg import G1RealEnvCfg, G1UnitreeCfg  # noqa: F401
 from .policy.g1_amo_policy_cfg import G1AmoPolicyCfg  # noqa: F401
 from .policy.g1_asap_policy_cfg import G1AsapLocoPolicyCfg, G1AsapPolicyCfg  # noqa: F401
-from .policy.g1_beyondmimic_policy_cfg import G1BeyondMimicPolicyCfg  # noqa: F401
-from .policy.g1_h2h_policy_cfg import G1H2HPolicyCfg  # noqa: F401
-from .policy.g1_kungfubot_policy_cfg import G1KungfuBotGeneralPolicyCfg, G1KungfuBotPolicyCfg  # noqa: F401
+from .policy.g1_beyondmimic_policy_cfg import G1BeyondMimicPolicyCfg  # noqa: F401 # noqa: F401
 from .policy.g1_smooth_policy_cfg import G1SmoothPolicyCfg  # noqa: F401
 from .policy.g1_twist_policy_cfg import G1TwistPolicyCfg  # noqa: F401
 from .policy.g1_unitree_policy_cfg import G1UnitreePolicyCfg, G1UnitreeWoGaitPolicyCfg  # noqa: F401
@@ -143,21 +141,6 @@ class g1_locomimic(RlLocoMimicPipelineCfg):
 
 # ======================== Configs for supported Policy ======================== #
 
-
-@cfg_registry.register
-class g1_h2h(RlPipelineCfg):
-    """
-    Human2Humanoid
-    """
-
-    robot: str = "g1"
-    env: G1MujocoEnvCfg = G1MujocoEnvCfg()
-    ctrl: list[KeyboardCtrlCfg | G1MotionH2HCtrlCfg] = [
-        KeyboardCtrlCfg(),
-        G1MotionH2HCtrlCfg(),
-    ]
-
-    policy: G1H2HPolicyCfg = G1H2HPolicyCfg()
 
 
 @cfg_registry.register
@@ -289,26 +272,6 @@ class g1_hdmi(RlPipelineCfg):
 
     policy: G1HdmiPushDoorPolicyCfg = G1HdmiPushDoorPolicyCfg()
 
-
-@cfg_registry.register
-class g1_kungfubot2(RlPipelineCfg):
-    """
-    PBHC KungfuBot2 General Policy
-    """
-
-    robot: str = "g1"
-    env: G1MujocoEnvCfg = G1MujocoEnvCfg()
-    ctrl: list[KeyboardCtrlCfg | G1MotionKungfuBotCtrlCfg] = [
-        KeyboardCtrlCfg(),
-        G1MotionKungfuBotCtrlCfg(
-            motion_name="kungfubot/Horse-stance_pose",  # put motion files in assets/motions/g1/phc/kungfubot
-        ),
-    ]
-
-    policy: G1KungfuBotGeneralPolicyCfg = G1KungfuBotGeneralPolicyCfg(
-        policy_name="horse_test_43000",  # this is a test model trained with only one motion
-        compatibility_old_version=True,  # for old version of kungfubot general policy (before 2025-11-13 bugfix #68)
-    )
 
 
 @cfg_registry.register
