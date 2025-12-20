@@ -187,8 +187,50 @@ class MujocoEnv(Environment):
             self._torso_quat = fk_info[self._torso_name]["quat"]
             self._torso_pos = fk_info[self._torso_name]["pos"]
 
-    def step(self, pd_target, hand_pose=None):
-        assert len(pd_target) == self.num_dofs, "pd_target len should be num_dofs of env"
+        # === Read specific sensors for HDMI policies ===
+        # Try to read 'door_panel_pos' and 'door_panel_quat' if they exist
+        self._door_panel_pos = None
+        self._door_panel_quat = None
+        
+        # We can cache these IDs later for performance, but for now safe lookup
+        try:
+            door_pos_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "door_panel_pos")
+            if door_pos_id >= 0:
+                adr = self.model.sensor_adr[door_pos_id]
+                self._door_panel_pos = self.data.sensordata[adr:adr+3].copy()
+            
+            door_quat_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "door_panel_quat")
+            if door_quat_id >= 0:
+                adr = self.model.sensor_adr[door_quat_id]
+                self._door_panel_quat = self.data.sensordata[adr:adr+4].copy()
+        except Exception:
+            pass
+
+    def get_data(self):
+        # reuse base class data
+        base_data = super().get_data()
+        
+        # extract dict from Box
+        data_dict = base_data.to_dict()
+        
+        # add extra sensors
+        if hasattr(self, "_door_panel_pos") and self._door_panel_pos is not None:
+            data_dict["door_panel_pos"] = self._door_panel_pos
+        if hasattr(self, "_door_panel_quat") and self._door_panel_quat is not None:
+            data_dict["door_panel_quat"] = self._door_panel_quat
+            
+        from box import Box
+        return Box(data_dict)
+
+    def step(self, control_input, hand_pose=None, mode="position"):
+        """Step the simulation with position or torque control.
+        
+        Args:
+            control_input: Either pd_target (positions) or torques depending on mode
+            hand_pose: Optional hand pose information
+            mode: "position" (default, computes PD torques) or "torque" (uses input directly)
+        """
+        assert len(control_input) == self.num_dofs, f"control_input len should be {self.num_dofs}, got {len(control_input)}"
 
         if hand_pose is not None:
             logger.info("Hand pose-->", hand_pose)
@@ -201,7 +243,14 @@ class MujocoEnv(Environment):
             self.viewer.render()
 
         for _ in range(self.sim_decimation):
-            torque = (pd_target - self.dof_pos) * self.stiffness - self.dof_vel * self.damping
+            if mode == "torque":
+                # Torque control: use input directly (HDMI reference mode)
+                torque = control_input
+            else:
+                # Position control: compute PD torques (legacy mode)
+                pd_target = control_input
+                torque = (pd_target - self.dof_pos) * self.stiffness - self.dof_vel * self.damping
+            
             torque = np.clip(torque, -self.torque_limits, self.torque_limits)
 
             # Periodic saturation diagnostics (helps debug slow tipping / foot instability).

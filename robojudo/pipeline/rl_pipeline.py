@@ -52,6 +52,18 @@ class PolicyWrapper:
         action = self.policy.get_action(obs)
         pd_target = action + self.policy.default_pos
         return self.actions_adapter.fit(pd_target, template=self.env_dof_cfg.default_pos)
+    
+    def get_torque(self, env_data, ctrl_data):
+        """Get torques from policy and adapt dimensions to environment."""
+        policy_output = self.policy(env_data, ctrl_data)
+        if "torque" in policy_output:
+            # Adapt torques from policy DoF (23) to env DoF (29)
+            torque_policy = policy_output["torque"]
+            # Use zero torque as template for uncontrolled joints
+            torque_env = self.actions_adapter.fit(torque_policy, template=np.zeros(len(self.env_dof_cfg.joint_names)))
+            return torque_env
+        else:
+            return None
 
     def get_init_dof_pos(self):
         return self.actions_adapter.fit(self.policy.get_init_dof_pos(), template=self.env_dof_cfg.default_pos)
@@ -158,17 +170,29 @@ class RlPipeline(Pipeline):
 
         if self.policy_enabled:
             obs, extras = self.policy.get_observation(env_data, ctrl_data)
-            pd_target = self.policy.get_pd_target(obs)
+            # Try to get torques from policy (for HDMI)
+            torque = self.policy.get_torque(env_data, ctrl_data)
+            
+            if torque is not None:
+                # Torque-based control (HDMI)
+                control_input = torque
+                control_mode = "torque"
+            else:
+                # Fallback to position control
+                pd_target = self.policy.get_pd_target(obs)
+                control_input = pd_target
+                control_mode = "position"
         else:
             # Hold standing pose; skip policy inference/log spam while paused.
-            pd_target = self.env.dof_cfg.default_pos
+            control_input = self.env.dof_cfg.default_pos
+            control_mode = "position"
             obs = None
             extras = {}
 
         if not dry_run:
-            self.env.step(pd_target, extras.get("hand_pose", None))
+            self.env.step(control_input, extras.get("hand_pose", None), mode=control_mode)
 
-        self.post_step_callback(env_data, ctrl_data, extras, pd_target)
+        self.post_step_callback(env_data, ctrl_data, extras, control_input)
 
     def prepare(self, init_motor_angle=None):
         if init_motor_angle is not None:

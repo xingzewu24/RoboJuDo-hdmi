@@ -90,3 +90,7 @@ class G1PushDoorMujocoEnvCfg(G1PushDoorEnvCfg, MujocoEnvCfg):
 
     # Stronger MuJoCo PD to improve standing stability
     dof: DoFConfig = G1HdmiDoFMuJoCo()
+    
+    # Match HDMI policy training frequency (50Hz)
+    # MuJoCo dt=0.002s, so decimation=10 -> control_dt=0.02s
+    decimation: int = 10

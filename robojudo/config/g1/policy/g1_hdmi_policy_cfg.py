@@ -277,11 +277,16 @@ class G1HdmiPushDoorPolicyCfg(G1HdmiPolicyCfg):
     checkpoint_name: str = "G1PushDoorHand"
     model_file: str = "policy-xg6644nr-final.onnx"
 
-    # Use a short warmup so the robot stabilizes before the walking-to-door motion kicks in.
-    warmup_steps: int = 100
+    # Extended warmup for better stabilization before walking motion activates.
+    warmup_steps: int = 0  # DISABLED warmup to allow immediate torque for standing (was 200)
+    
+    # More conservative warmup action limits (ignored if warmup_steps=0)
+    warmup_max_action_start: float = 1.0
+    warmup_max_action_final: float = 1.0
 
-    # Slightly reduce overall action magnitude for sim stability.
-    action_scale: float = 0.2
+    # Increase action magnitude to generate sufficient torque (stiffness is low ~40Nm/rad)
+    action_scale: float = 1.0  # Was 0.1/0.25. Reference likely uses 1.0.
+
 
     # No sign flips in MuJoCo by default; keep symmetric joints untouched.
     action_sign_flip_joints: list[str] = []

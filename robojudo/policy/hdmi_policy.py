@@ -55,6 +55,33 @@ def quat_rotate_inverse_numpy(q: np.ndarray, v: np.ndarray) -> np.ndarray:
     return (a - b + c).reshape(shape)
 
 
+def quat_rotate_numpy(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate a vector by a quaternion.
+
+    NOTE: HDMI/Isaac convention uses quaternions in [w, x, y, z].
+
+    Args:
+        q: Quaternion in (w, x, y, z) format. Shape (..., 4)
+        v: Vector to rotate. Shape (..., 3)
+
+    Returns:
+        Rotated vector. Shape (..., 3)
+    """
+    shape = v.shape
+    q = q.reshape(-1, 4)
+    v = v.reshape(-1, 3)
+    
+    q_w = q[:, 0]
+    q_vec = q[:, 1:]
+    
+    a = v * (2.0 * q_w**2 - 1.0)[:, np.newaxis]
+    b = np.cross(q_vec, v) * q_w[:, np.newaxis] * 2.0
+    dot_product = np.sum(q_vec * v, axis=1, keepdims=True)
+    c = q_vec * dot_product * 2.0
+    
+    return (a + b + c).reshape(shape)
+
+
 @policy_registry.register
 class HdmiPolicy(Policy):
     """
@@ -145,6 +172,21 @@ class HdmiPolicy(Policy):
         self.default_pos_isaac_29 = np.array(DEFAULT_POS_ISAAC_29, dtype=np.float32)
         self.default_pos_isaac_23 = np.array(DEFAULT_POS_ISAAC_23, dtype=np.float32)
         
+        # Load PD gains for torque-based control (matching HDMI reference)
+        # CRITICAL: Use MuJoCo-tuned gains (G1HdmiDoFMuJoCo) instead of raw Isaac gains.
+        # MuJoCo needs ~3x stiffness to hold poses compared to Isaac/Unitree simulations.
+        try:
+            from robojudo.config.g1.env.g1_mujuco_env_cfg import G1HdmiDoFMuJoCo
+            hdmi_dof = G1HdmiDoFMuJoCo()
+            logger.info("[HdmiPolicy] Loaded MuJoCo-tuned PD gains (Kp scaled by ~3.0)")
+        except ImportError:
+            logger.warning("[HdmiPolicy] Could not import G1HdmiDoFMuJoCo, using base gains (WEAK)")
+            from robojudo.config.g1.env.g1_env_cfg import G1HdmiDoF
+            hdmi_dof = G1HdmiDoF()
+
+        self.kp_full = np.array(hdmi_dof.stiffness, dtype=np.float32)  # (29,) MuJoCo order
+        self.kd_full = np.array(hdmi_dof.damping, dtype=np.float32)    # (29,) MuJoCo order
+        
         # Setup ONNX session
         sess_options = ort.SessionOptions()
         
@@ -208,11 +250,14 @@ class HdmiPolicy(Policy):
         # Store Isaac-order raw joint positions (29,).
         self._joint_pos_hist: deque[np.ndarray] = deque(maxlen=9)
         
-        # Observation scaling factors (common IsaacGym/HDMI defaults)
+        # Observation scaling factors
+        # NOTE: HDMI reference implementation does NOT apply scaling to observations!
+        # The policy was trained with raw (unscaled) observations.
+        # Previously had ang_vel=0.25, dof_vel=0.05 which caused instability.
         self.obs_scales = {
-            "ang_vel": 0.25,
-            "dof_vel": 0.05,
-            "dof_pos": 1.0,
+            "ang_vel": 1.0,  # Unscaled (HDMI reference)
+            "dof_vel": 1.0,  # Unscaled (HDMI reference)  
+            "dof_pos": 1.0,  # Unscaled
         }
         
         # Object tracking state (door at x=3.0m)
@@ -426,7 +471,7 @@ class HdmiPolicy(Policy):
         ).squeeze(0)
         return projected_gravity
     
-    def _compute_object_obs(self, base_pos: np.ndarray, base_quat: np.ndarray) -> np.ndarray:
+    def _compute_object_obs(self, base_pos: np.ndarray, base_quat: np.ndarray, env_data) -> np.ndarray:
         """
         Compute object observations for door pushing task.
         
@@ -438,41 +483,78 @@ class HdmiPolicy(Policy):
         Args:
             base_pos: Robot base position in world frame (3,)
             base_quat: Robot base quaternion in (w, x, y, z) format (4,)
+            env_data: Environment data containing sensor information
         
         Returns:
             Object observation tensor (7,)
         """
-        # Door position in world frame
-        door_pos_w = self.door_pos_world
+        # Read door_panel position and orientation from MuJoCo sensors
+        # IMPORTANT: Use door_panel (the moveable part), not door (the fixed frame)
+        try:
+            # Access MuJoCo sensor data directly
+            # door_panel_pos sensor index: we need to find it
+            door_panel_pos_sensor_id = self._get_sensor_id(env_data, "door_panel_pos")
+            door_panel_quat_sensor_id = self._get_sensor_id(env_data, "door_panel_quat")
+            
+            # Try to read from env_data (populated by MujocoEnv)
+            # Note: MujocoEnv returns a Box object which supports dot access, or we can use getattr
+            door_panel_pos = getattr(env_data, "door_panel_pos", None)
+            door_panel_quat = getattr(env_data, "door_panel_quat", None)
+                
+            if door_panel_pos is not None and door_panel_quat is not None:
+                door_panel_pos_w = door_panel_pos
+                door_panel_quat_w = door_panel_quat
+            else:
+                # Fallback to hardcoded if we can't access sensors
+                # Door frame is at [3, 0, 0]
+                # Door panel is at [0, 0.5, 0] relative to frame
+                # So world pos is [3.0, 0.5, 0.0]
+                logger.warning(f"[HdmiPolicy] using hardcoded door panel position (sensors not found)")
+                door_panel_pos_w = np.array([3.0, 0.5, 0.0], dtype=np.float32)
+                door_panel_quat_w = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        except Exception as e:
+            # Fallback to hardcoded door position
+            logger.warning(f"[HdmiPolicy] Failed to read door sensors, using hardcoded position: {e}")
+            door_panel_pos_w = self.door_pos_world.copy()
+            door_panel_quat_w = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         
-        # Get yaw-only quaternion for computing body-frame coordinates.
-        # IMPORTANT: base_quat is a general quaternion (w, x, y, z). Normalizing only (w, z)
-        # is not a valid yaw extraction once roll/pitch exist. Extract yaw from the full quat.
+        # Get yaw-only quaternion for computing body-frame coordinates
         w, x, y, z = float(base_quat[0]), float(base_quat[1]), float(base_quat[2]), float(base_quat[3])
         yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
         yaw_quat = np.array([np.cos(yaw * 0.5), 0.0, 0.0, np.sin(yaw * 0.5)], dtype=np.float32)
         
-        # Object XY position in body frame
-        door_pos_b = quat_rotate_inverse_numpy(
+        # Object XY position in body frame (door_panel, not door)
+        door_panel_pos_b = quat_rotate_inverse_numpy(
             yaw_quat[None, :],
-            (door_pos_w - base_pos)[None, :]
+            (door_panel_pos_w - base_pos)[None, :]
         ).squeeze(0)
-        object_xy_b = door_pos_b[:2]  # (2,)
+        object_xy_b = door_panel_pos_b[:2]  # (2,)
         
-        # Object heading in body frame (door facing direction)
-        # Door panel initially faces -X in world frame (perpendicular to wall)
-        door_heading_w = np.array([1.0, 0.0, 0.0])  # Door opening direction
+        # Object heading in body frame (door panel facing direction)
+        # Extract yaw from door_panel quaternion
+        dw, dx, dy, dz = door_panel_quat_w
+        door_yaw = np.arctan2(2.0 * (dw * dz + dx * dy), 1.0 - 2.0 * (dy * dy + dz * dz))
+        door_yaw_quat = np.array([np.cos(door_yaw * 0.5), 0.0, 0.0, np.sin(door_yaw * 0.5)], dtype=np.float32)
+        
+        # Door opening direction in world frame
+        door_heading_w = quat_rotate_numpy(
+            door_yaw_quat[None, :],
+            np.array([[1.0, 0.0, 0.0]])
+        ).squeeze(0)
+        
         door_heading_b = quat_rotate_inverse_numpy(
             yaw_quat[None, :],
             door_heading_w[None, :]
         ).squeeze(0)
         object_heading_b = door_heading_b[:2]  # (2,)
         
-        # Reference contact position (from yaml: offset [0, -0.6, 1.0] relative to door_panel)
+        # Reference contact position (YAML config: offset [0, -0.6, 1.0] relative to door_panel)
         # This represents where the robot should contact the door
-        # In body frame, relative to robot
-        contact_offset_w = np.array([0.0, -0.6, 1.0])  # Door panel contact point offset
-        contact_pos_w = door_pos_w + contact_offset_w
+        contact_offset_w = quat_rotate_numpy(
+            door_panel_quat_w[None, :],
+            np.array([[0.0, -0.6, 1.0]])
+        ).squeeze(0)
+        contact_pos_w = door_panel_pos_w + contact_offset_w
         contact_pos_b = quat_rotate_inverse_numpy(
             yaw_quat[None, :],
             (contact_pos_w - base_pos)[None, :]
@@ -485,8 +567,29 @@ class HdmiPolicy(Policy):
             object_heading_b, # 2
             ref_contact_pos_b # 3
         ]).astype(np.float32)
+
+        if self.step_count % 50 == 0:
+            logger.info(f"[HdmiPolicy] Object Obs Step {self.step_count}:")
+            logger.info(f"  door_panel_pos_w: {door_panel_pos_w}")
+            logger.info(f"  door_panel_quat_w: {door_panel_quat_w}")
+            logger.info(f"  base_pos: {base_pos}")
+            logger.info(f"  object_xy_b: {object_xy_b}")
+            logger.info(f"  ref_contact_pos_b: {ref_contact_pos_b}")
+            logger.info(f"  contact_pos_w: {contact_pos_w}")
         
         return object_obs
+    
+    def _get_sensor_id(self, env_data, sensor_name: str):
+        """Get sensor ID from MuJoCo model by name."""
+        try:
+            import mujoco
+            model = env_data._env.model if hasattr(env_data, '_env') else None
+            if model is not None:
+                sensor_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, sensor_name)
+                return sensor_id if sensor_id >= 0 else None
+            return None
+        except:
+            return None
     
     def _compute_command_obs(self) -> np.ndarray:
         """
@@ -700,7 +803,7 @@ class HdmiPolicy(Policy):
         command_obs = self._compute_command_obs()  # (356,)
         
         # 'object' observation group (7): object position/orientation relative to robot
-        object_obs = self._compute_object_obs(base_pos, base_quat)  # (7,)
+        object_obs = self._compute_object_obs(base_pos, base_quat, env_data)  # (7,)
         
         # Build observation dictionary for ONNX model
         obs_dict = {
@@ -791,6 +894,9 @@ class HdmiPolicy(Policy):
         action = (1 - self.action_beta) * self.last_action + self.action_beta * action
         self.last_action = action.copy()
         
+        # Store UNCLAMPED action for history (matches reference)
+        action_for_history = action.copy()
+        
         # CRITICAL: Clamp actions during warmup for stability
         # During warmup, the robot should stay near default pose
         if self.warmup_steps > 0 and self.step_count <= self.warmup_steps:
@@ -808,7 +914,7 @@ class HdmiPolicy(Policy):
         
         # Store for next step's observation (shift history and add new)
         self.prev_actions_history.pop(0)  # Remove oldest
-        self.prev_actions_history.append(action.copy())  # Add newest
+        self.prev_actions_history.append(action_for_history)  # Add newest
         self.prev_actions_buffer = action.copy()
         
         # Apply per-joint action scaling from HDMI yaml
@@ -882,14 +988,48 @@ class HdmiPolicy(Policy):
         
         # Note: Warmup action clamping is now done in get_action()
         
-        # Compute target joint positions (in MuJoCo order)
-        # self.default_pos is already in MuJoCo order (from config)
+        # Compute target joint positions (in MuJoCo order for 23 action DOFs)
+        # self.default_pos is in MuJoCo order for 23 action joints
         target_q = self.default_pos.copy() + actions_mujoco
+        
+        # TORQUE-BASED CONTROL (matching HDMI reference)
+        # Compute PD torques: tau = kp * (q_des - q_actual) + kd * (0 - dq_actual)
+        # where dq_des = 0 (no velocity tracking)
+        
+        # Get current state from observation joints (29 DOF, MuJoCo order)
+        current_q_obs = env_data.dof_pos  # (29,) MuJoCo order (obs joints)
+        current_dq_obs = env_data.dof_vel  # (29,) MuJoCo order (obs joints)
+        
+        # Map action joint indices into observation joints
+        # Action joints are a subset of observation joints
+        action_joint_names = self.cfg_policy.action_dof.joint_names  # 23 joints, MuJoCo order
+        obs_joint_names = self.cfg_obs_dof.joint_names  # 29 joints, MuJoCo order
+        
+        # Find indices of action joints within observation joints
+        action_indices_in_obs = np.array([
+            obs_joint_names.index(name) for name in action_joint_names
+        ], dtype=np.int32)
+        
+        # Extract current state for action joints
+        current_q = current_q_obs[action_indices_in_obs]  # (23,)
+        current_dq = current_dq_obs[action_indices_in_obs]  # (23,)
+        
+        # Extract PD gains for action joints
+        kp = self.kp_full[action_indices_in_obs]  # (23,)
+        kd = self.kd_full[action_indices_in_obs]  # (23,)
+        
+        # Compute PD torques
+        tau = (
+            kp * (target_q - current_q) +
+            kd * (0.0 - current_dq)  # dq_des = 0
+        )
         
         # Debug first few steps
         if self.step_count <= 3:
             logger.info(f"[HdmiPolicy] __call__ step {self.step_count}:")
             logger.info(f"  actions_mujoco[:6]={actions_mujoco[:6]}")
             logger.info(f"  target_q[:6]={target_q[:6]}")
+            logger.info(f"  current_q[:6]={current_q[:6]}")
+            logger.info(f"  tau[:6]={tau[:6]}")
         
-        return {"target_q": target_q}
+        return {"torque": tau}  # Return torques instead of target_q
